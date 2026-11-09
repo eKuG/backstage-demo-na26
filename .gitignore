@@ -15,3 +15,5 @@ PLAN.md
 # backstage build output (the app has its own .gitignore for node_modules etc.)
 backstage/dist-types/
 backstage/packages/*/dist/
+deck/build_deck.py
+deck/tools/trace_id.txt
