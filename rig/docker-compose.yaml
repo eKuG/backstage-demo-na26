@@ -1,0 +1,138 @@
+# BackstageCon NA 2026 demo rig: Backstage observed in four layers.
+#   LAYER=0  kernel only  : OBI (eBPF) traces + RED + runtime metrics, zero code, zero restart
+#   LAYER=1  + SDK        : NODE_OPTIONS --require auto-instrumentation (in-process spans, winston logs, Backstage meters)
+# Switch with: LAYER=1 docker compose up -d backstage obi
+name: backstagecon
+networks:
+  default:
+    name: backstagecon
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: backstage
+      POSTGRES_PASSWORD: pg-demo-pass
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backstage"]
+      interval: 3s
+      retries: 20
+    ports: ["5432:5432"]
+
+  backstage:
+    image: backstage:latest
+    container_name: backstage
+    depends_on:
+      postgres: { condition: service_healthy }
+    env_file:
+      - layers/common.env
+      - layers/${LAYER:-0}.env
+    ports: ["7007:7007"]
+    # OBI's Node.js injector talks to the inspector it opens with SIGUSR1; no extra caps needed on the target.
+
+  # ---- Layer 0: kernel-side, zero-code ------------------------------------------------------
+  obi:
+    image: otel/ebpf-instrument:v1.0.0
+    container_name: obi
+    privileged: true
+    pid: "host"
+    env_file:
+      - layers/obi-${LAYER:-0}.env
+    environment:
+      OTEL_EBPF_OPEN_PORT: "7007,5432"
+      OTEL_EBPF_LOG_LEVEL: INFO
+      OTEL_EBPF_BPF_CONTEXT_PROPAGATION: headers
+      OTEL_EBPF_BPF_TRACK_REQUEST_HEADERS: "true"
+      OTEL_EBPF_METRICS_INTERVAL: 10s
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - /sys/fs/bpf:/sys/fs/bpf
+    depends_on: [otelcol, backstage]
+
+  profiler:
+    image: otel/opentelemetry-collector-ebpf-profiler:0.164.0
+    container_name: profiler
+    command: ["--config=/etc/profiler.yaml", "--feature-gates=service.profilesSupport"]
+    privileged: true
+    pid: "host"
+    volumes:
+      - ./profiler/config.yaml:/etc/profiler.yaml:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+    depends_on: [pyroscope]
+
+  # ---- The pipeline --------------------------------------------------------------------------
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    container_name: otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      OBI_TRACES: ${OBI_TRACES:-on}
+    volumes:
+      - ./collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"   # browser analytics POSTs here (CORS enabled)
+    depends_on: [tempo, loki, prometheus]
+
+  # ---- Backends ------------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-otlp-receiver
+      - --enable-feature=exemplar-storage
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+    ports: ["3200:3200"]
+
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+    ports: ["3100:3100"]
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    ports: ["4040:4040"]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor,traceToProfiles
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3300:3000"]
+    depends_on: [prometheus, tempo, loki, pyroscope]
+
+  # ---- Synthetic developers ------------------------------------------------------------------
+  loadgen:
+    image: curlimages/curl:latest
+    container_name: loadgen
+    entrypoint: ["/bin/sh", "/loadgen.sh"]
+    environment:
+      BASE: http://backstage:7007
+      TOKEN: demo-loadgen-token-not-a-secret
+      RPS: "8"
+    volumes:
+      - ./loadgen/loadgen.sh:/loadgen.sh:ro
+    depends_on: [backstage]
+    profiles: ["load"]

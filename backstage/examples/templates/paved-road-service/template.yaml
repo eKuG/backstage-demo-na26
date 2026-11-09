@@ -1,0 +1,37 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: paved-road-service
+  title: Paved Road Service
+  description: The golden path. Runs entirely offline so it always succeeds; the one everybody should be using.
+  annotations:
+    backstage.io/time-saved: PT4H
+spec:
+  owner: group:default/guests
+  type: service
+  parameters:
+    - title: Service
+      required: [name]
+      properties:
+        name:
+          title: Name
+          type: string
+          ui:autofocus: true
+  steps:
+    - id: fetch
+      name: Fetch skeleton
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+    - id: wait
+      name: Provision (simulated)
+      action: debug:wait
+      input:
+        milliseconds: 800
+    - id: log
+      name: Done
+      action: debug:log
+      input:
+        message: Created ${{ parameters.name }} on the paved road

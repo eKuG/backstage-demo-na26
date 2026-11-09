@@ -1,0 +1,32 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: slow-data-pipeline
+  title: Data Pipeline (legacy)
+  description: Works, but takes forever. The p95 everybody complains about in retros.
+spec:
+  owner: group:default/guests
+  type: service
+  parameters:
+    - title: Pipeline
+      required: [name]
+      properties:
+        name:
+          title: Name
+          type: string
+  steps:
+    - id: validate
+      name: Validate schema
+      action: debug:wait
+      input:
+        milliseconds: 2000
+    - id: provision
+      name: Provision warehouse
+      action: debug:wait
+      input:
+        milliseconds: 6000
+    - id: log
+      name: Done
+      action: debug:log
+      input:
+        message: Pipeline ${{ parameters.name }} provisioned (slowly)

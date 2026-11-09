@@ -1,0 +1,23 @@
+# Fourth signal: CPU profiles of every process on the host, JS frames included, no agent in Backstage.
+receivers:
+  profiling:
+    samples_per_second: 50
+processors:
+  transform/service_name:
+    error_mode: ignore
+    profile_statements:
+      - set(resource.attributes["service.name"], "backstage") where resource.attributes["process.executable.name"] == "node"
+      - set(resource.attributes["service.name"], "postgres") where IsMatch(resource.attributes["process.executable.name"], "^postgres")
+      - set(resource.attributes["service.name"], "other") where resource.attributes["service.name"] == nil
+  batch: {}
+exporters:
+  otlp_grpc/pyroscope:
+    endpoint: pyroscope:4040
+    tls:
+      insecure: true
+service:
+  pipelines:
+    profiles:
+      receivers: [profiling]
+      processors: [transform/service_name]
+      exporters: [otlp_grpc/pyroscope]

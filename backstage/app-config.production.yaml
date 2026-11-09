@@ -1,0 +1,57 @@
+app:
+  baseUrl: http://localhost:7007
+  analytics:
+    otlp:
+      # Browser posts AnalyticsApi events straight to the Collector as OTLP/JSON log records.
+      endpoint: http://localhost:4318/v1/logs
+
+backend:
+  baseUrl: http://localhost:7007
+  listen: ':7007'
+  database:
+    client: pg
+    connection:
+      host: ${POSTGRES_HOST}
+      port: ${POSTGRES_PORT}
+      user: ${POSTGRES_USER}
+      password: ${POSTGRES_PASSWORD}
+  auth:
+    externalAccess:
+      # synthetic developers (loadgen) call the API with this bearer token
+      - type: static
+        options:
+          token: ${LOADGEN_TOKEN}
+          subject: loadgen
+  auditor:
+    # Audit events default 'low' -> debug, which the info-level logger drops. We want them: they are product analytics.
+    severityLogLevelMappings:
+      low: info
+  tracing:
+    capture:
+      endUser: true
+
+auth:
+  providers:
+    guest:
+      dangerouslyAllowOutsideDevelopment: true
+
+catalog:
+  locations:
+    - type: file
+      target: ./examples/entities.yaml
+    - type: file
+      target: ./examples/org.yaml
+      rules:
+        - allow: [User, Group]
+    - type: file
+      target: ./examples/template/template.yaml
+      rules:
+        - allow: [Template]
+    - type: file
+      target: ./examples/templates/paved-road-service/template.yaml
+      rules:
+        - allow: [Template]
+    - type: file
+      target: ./examples/templates/slow-data-pipeline/template.yaml
+      rules:
+        - allow: [Template]

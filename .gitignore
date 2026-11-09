@@ -1,0 +1,17 @@
+# local artefacts
+logs/
+.DS_Store
+# deck: ship the PDF, not the working files
+deck/original/
+deck/template/
+deck/render/
+deck/*.pptx
+deck/*_slide_text.md
+deck/notes_v3.json
+deck/content.json
+# speaker-private
+RUNBOOK.md
+PLAN.md
+# backstage build output (the app has its own .gitignore for node_modules etc.)
+backstage/dist-types/
+backstage/packages/*/dist/

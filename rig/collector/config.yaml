@@ -1,0 +1,154 @@
+# One Collector, three jobs:
+#   1. receive everything (OBI, SDK, browser) over OTLP
+#   2. turn spans/logs into PRODUCT metrics (per-plugin RED, audit events, adoption events)
+#   3. fan out to Tempo / Loki / Prometheus
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins: ["http://localhost:7007", "http://127.0.0.1:7007"]
+          allowed_headers: ["*"]
+  # The database Backstage does not own: query stats straight from Postgres, no app code involved.
+  postgresql:
+    endpoint: postgres:5432
+    transport: tcp
+    username: backstage
+    password: pg-demo-pass
+    tls:
+      insecure: true
+    collection_interval: 15s
+
+processors:
+  batch: {}
+  # OBI also sees the Node inspector socket it opened itself (port 9229); not a product signal.
+  filter/inspector:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["server.port"] == 9229'
+        - 'attributes["url.path"] == "/json/list"'
+        # Layer 1: the SDK owns app spans; drop OBI's copy so RED is not double counted (OBI_TRACES=off).
+        - 'resource.attributes["telemetry.distro.name"] == "opentelemetry-ebpf-instrumentation" and "${env:OBI_TRACES}" == "off"'
+    metrics:
+      datapoint:
+        - 'attributes["server.port"] == 9229'
+  # Prometheus' OTLP endpoint wants cumulative; the count connector emits deltas.
+  delta_to_cumulative: {}
+  # Every Backstage backend plugin lives under /api/<pluginId>/... : that one fact gives us a product dimension.
+  transform/plugin:
+    error_mode: ignore
+    trace_statements:
+      - set(span.attributes["backstage.plugin"], span.attributes["url.path"]) where span.attributes["url.path"] != nil and IsMatch(span.attributes["url.path"], "^/api/[A-Za-z0-9_-]+")
+      - replace_pattern(span.attributes["backstage.plugin"], "^/api/([A-Za-z0-9_-]+).*$", "$$1") where span.attributes["backstage.plugin"] != nil
+      - set(span.attributes["backstage.plugin"], "app") where span.attributes["backstage.plugin"] == nil and span.kind == SPAN_KIND_SERVER and span.attributes["url.path"] != nil
+      # Low-cardinality route when neither express nor OBI gave one
+      - set(span.attributes["http.route"], span.attributes["url.path"]) where span.attributes["http.route"] == nil and span.attributes["url.path"] != nil
+      - replace_pattern(span.attributes["http.route"], "/[0-9a-fA-F-]{16,}", "/{id}") where span.attributes["http.route"] != nil
+      - replace_pattern(span.attributes["http.route"], "^/api/([A-Za-z0-9_-]+)/static/.*$", "/api/$$1/static/*") where span.attributes["http.route"] != nil
+    log_statements:
+      # Backstage auditor events arrive as winston records with nested maps; flatten what the dashboards need.
+      - set(log.attributes["backstage.actor"], log.attributes["actor"]["actorId"]) where log.attributes["actor"] != nil
+      - set(log.attributes["backstage.query_type"], log.attributes["meta"]["queryType"]) where log.attributes["meta"] != nil
+      - set(log.attributes["backstage.action_type"], log.attributes["meta"]["actionType"]) where log.attributes["meta"] != nil
+      - set(log.attributes["backstage.template"], log.attributes["meta"]["templateRef"]) where log.attributes["meta"] != nil
+
+connectors:
+  # RED per plugin, derived from whichever span source is active (OBI in layer 0, SDK in layer 1).
+  span_metrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.request.method
+      - name: http.response.status_code
+      - name: backstage.plugin
+      - name: http.route
+      - name: server.address
+      - name: db.system.name
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 10s
+    aggregation_cardinality_limit: 5000
+  service_graph:
+    latency_histogram_buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s]
+    store:
+      ttl: 5s
+      max_items: 2000
+  # Logs -> product counters. No code in Backstage knows these metrics exist.
+  count:
+    logs:
+      backstage.audit.events:
+        description: Backstage auditor events (who did what, and did it work)
+        conditions:
+          - 'attributes["isAuditEvent"] == true'
+        attributes:
+          - key: plugin
+          - key: eventId
+          - key: status
+          - key: backstage.actor
+            default_value: unknown
+          - key: backstage.query_type
+            default_value: ""
+          - key: backstage.action_type
+            default_value: ""
+          - key: backstage.template
+            default_value: ""
+      backstage.analytics.events:
+        description: Frontend AnalyticsApi events (navigate, click, search, create, discover, not-found)
+        conditions:
+          - 'attributes["backstage.analytics.action"] != nil'
+        attributes:
+          - key: backstage.analytics.action
+          - key: backstage.plugin
+            default_value: unknown
+          - key: enduser.id
+            default_value: anonymous
+      backstage.search.queries:
+        description: Search queries by whether they returned anything
+        conditions:
+          - 'attributes["backstage.analytics.action"] == "search"'
+        attributes:
+          - key: backstage.search.zero_results
+            default_value: "false"
+          - key: enduser.id
+            default_value: anonymous
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+  otlp_http/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [filter/inspector, transform/plugin, batch]
+      exporters: [otlp_grpc/tempo, span_metrics, service_graph]
+    logs:
+      receivers: [otlp]
+      processors: [transform/plugin, batch]
+      exporters: [otlp_http/loki, count]
+    metrics:
+      receivers: [otlp, postgresql, span_metrics, service_graph, count]
+      processors: [filter/inspector, delta_to_cumulative, batch]
+      exporters: [otlp_http/prometheus]
